@@ -1,16 +1,25 @@
-from .bam import process_bismark_read, process_dorado_read
-import argparse, os, uuid, sys
-
+import argparse
+import glob
 import multiprocessing as mp
-
-import pandas as pd
-import numpy as np
-
-from functools import partial
-from Bio import SeqIO
-
-import pickle, pysam, os, glob, random, re, time
+import os
+import pickle
+import random
+import re
+import sys
+import time
+import uuid
 import warnings
+from functools import partial
+from typing import List
+
+import numpy as np
+import pandas as pd
+import pysam
+from Bio import SeqIO
+from sklearn.model_selection import train_test_split
+
+from .bam import process_bismark_read, process_dorado_read
+
 
 # https://gist.github.com/EdwinChan/3c13d3a746bb3ec5082f
 def globalize(func):
@@ -159,7 +168,7 @@ def finetune_data_generate(
         sc_dataset: str = None,
         input_file: str = None,
         n_mers: int = 3,
-        split_ratio: float = 1.0,
+        split_ratios: List[float] = [0.8, 0.1, 0.1],
         n_dmrs: int = -1,
         n_cores: int = 1,
         seed: int = 950410,
@@ -191,7 +200,7 @@ def finetune_data_generate(
         ValueError("The .csv file for DMRs must contain chr, start and end in the header.")
 
     # Remove chrX, chrY, chrM and so on in DMRs
-    # Genome style 
+    # Genome style
     if "chr" in str(dmrs["chr"][0]):
         regex_expr = "chr\d+" if ignore_sex_chromo else "chr[\d+|X|Y]"
         old_keys = list(dict_ref.keys())
@@ -205,7 +214,7 @@ def finetune_data_generate(
             if "chr" in k: dict_ref[k.split("chr")[1]] = dict_ref.pop(k)
 
     dmrs = dmrs[dmrs["chr"].str.contains(regex_expr, regex=True)]
-    
+
     if dmrs.shape[0] == 0:
         ValueError("Could not find any DMRs. Please make sure chromosomes have \'chr\' at the beginning.")
 
@@ -293,18 +302,26 @@ def finetune_data_generate(
     else:
         ValueError("Could not find any reads overlapping with the given DMRs. Please try different regions.")
 
-    print("Total sequences per cell type")
-    print(df_reads["ctype"].value_counts())
-    # Split the data into train and valid/test
-    if (split_ratio < 1.0) and (split_ratio > 0.0):
+    # Split the data into train and train/valid/test
+    if np.sum(split_ratios) == 1 and len(split_ratios) == 3:
         fp_train_seq = os.path.join(output_dir, "train_seq.csv")
+        fp_val_seq = os.path.join(output_dir, "val_seq.csv")
         fp_test_seq = os.path.join(output_dir, "test_seq.csv")
-        n_train = int(df_reads.shape[0]*split_ratio)
-        print("Size - train %d seqs , valid %d seqs "%(n_train, df_reads.shape[0] - n_train))
+
+        # TODO: make this split memory efficient
+        df_train, df_test = train_test_split(df_reads, test_size=split_ratios[0],
+                                             random_state=seed,
+                                             stratify=df_reads["ctype"])
+        test_size = split_ratios[2] / (split_ratios[0] + split_ratios[1])
+        df_val, df_test = train_test_split(df_reads, test_size=test_size,
+                                           random_state=seed,
+                                           stratify=df_reads["ctype"])
+        print("Size - train %d seqs , valid %d seqs "%(df_train.shape[0], df_test.shape[0]))
 
         # Write train & test files
-        df_reads.loc[:n_train,:].to_csv(fp_train_seq, sep="\t", header=True, index=None)
-        df_reads.loc[n_train:,:].to_csv(fp_test_seq, sep="\t", header=True, index=None)
+        df_train.to_csv(fp_train_seq, sep="\t", header=True, index=None)
+        df_val.to_csv(fp_val_seq, sep="\t", header=True, index=None)
+        df_test.to_csv(fp_test_seq, sep="\t", header=True, index=None)
     else:
         fp_data_seq = os.path.join(output_dir, "data.csv")
         df_reads.to_csv(fp_data_seq, sep="\t", header=True, index=None)
