@@ -17,6 +17,7 @@ import pandas as pd
 import pysam
 from Bio import SeqIO
 from sklearn.model_selection import train_test_split
+from tqdm.auto import tqdm
 
 from .bam import process_bismark_read, process_dorado_read
 
@@ -133,7 +134,7 @@ def read_extract(bam_file_path: str, dict_ref: dict, k: int, dmrs: pd.DataFrame,
     @globalize
     def _get_methylseq(dmr, bam_file_path: str, k: int, methyl_caller: str):
         '''
-            Return a dictionary of DNA seq, cell type and methylation seq processed in a 3-mer seq
+        Return a dictionary of DNA seq, cell type and methylation seq processed in a 3-mer seq
         '''
         aln = pysam.AlignmentFile(bam_file_path, "rb")
 
@@ -149,10 +150,13 @@ def read_extract(bam_file_path: str, dict_ref: dict, k: int, dmrs: pd.DataFrame,
         with mp.Pool(ncores) as pool:
             # Convert read sequences to k-mer sequences
             seqs = pool.map(partial(_get_methylseq,
-                                    bam_file_path = bam_file_path, k=k, methyl_caller=methyl_caller),
+                                    bam_file_path=bam_file_path, k=k,
+                                    methyl_caller=methyl_caller),
                             dmrs.to_dict("records"))
     else:
-        seqs = [_get_methylseq(dmr, bam_file_path = bam_file_path, k=k, methyl_caller = methyl_caller) for dmr in dmrs.to_dict("records")]
+        seqs = [_get_methylseq(dmr, bam_file_path = bam_file_path, k=k,
+                               methyl_caller = methyl_caller)
+                for dmr in dmrs.to_dict("records")]
 
     # Filter None values that means no overlapping read with the given DMR
     seqs = list(filter(lambda i: i is not None, seqs))
@@ -173,7 +177,8 @@ def finetune_data_generate(
         n_cores: int = 1,
         seed: int = 950410,
         ignore_sex_chromo: bool = True,
-        methyl_caller: str = "bismark"
+        methyl_caller: str = "bismark",
+        verbose: int = 2
     ):
 
     # Setup random seed
@@ -220,19 +225,23 @@ def finetune_data_generate(
 
     # Sort by statistics if available
     if "areaStat" in dmrs.keys():
-        print("DMRs sorted by areaStat")
+        if verbose > 0:
+            print("DMRs sorted by areaStat")
         dmrs["abs_areaStat"]  = dmrs["areaStat"].abs()
-        dmrs = dmrs.sort_values(by="abs_areaStat", ascending=False)
+        dmrs = dmrs.sort_values(by="areaStat", ascending=False)
     elif "diff.Methy" in dmrs.keys():
-        print("DMRs sorted by diff.Methy")
+        if verbose > 0:
+            print("DMRs sorted by diff.Methy")
         dmrs["abs_diff.Methy"]  = dmrs["diff.Methy"].abs()
-        dmrs = dmrs.sort_values(by="abs_diff.Methy", ascending=False)
+        dmrs = dmrs.sort_values(by="diff.Methy", ascending=False)
     else:
-        print("Could not find any statistics to sort DMRs")
+        if verbose > 0:
+            print("Could not find any statistics to sort DMRs")
 
     # Select top n dmrs based on
     if n_dmrs > 0:
-        print(f"{n_dmrs} are selected based on the statistics")
+        if verbose > 0:
+            print(f"{n_dmrs} are selected based on the statistics")
         list_dmrs = list()
         for c in dmrs["ctype"].unique(): #  For the case when multiple cell types are given
             ctype_dmrs = dmrs[dmrs["ctype"]==c]
@@ -249,9 +258,11 @@ def finetune_data_generate(
 
     # Save DMRs in a new file
     dmrs.to_csv(fp_dmr, sep="\t", index=False)
-    print(dmrs.head())
+    if verbose > 2:
+        print(dmrs.head())
 
-    print(f"Number of DMRs to extract sequence reads: {len(dmrs)}")
+    if verbose > 0:
+        print(f"Number of DMRs to extract sequence reads: {len(dmrs)}")
 
     # check whether the input is a file or a file list
     if ( not sc_dataset ) and ( not input_file ):
@@ -269,6 +280,7 @@ def finetune_data_generate(
 
     # Collect reads from the .bam files
     df_reads = list()
+    tqdm_bar = tqdm(total=len(sc_files), desc="Collecting reads from .bam files")
     for f_sc in sc_files:
         f_sc = f_sc.strip().split("\t")
         f_sc_bam = f_sc[0]
@@ -276,6 +288,8 @@ def finetune_data_generate(
         extracted_reads = read_extract(f_sc_bam, dict_ref, k=3, dmrs=dmrs, ncores=n_cores, methyl_caller=methyl_caller)
         if extracted_reads is None:
             continue
+
+        extracted_reads["filename"] = os.path.basename(f_sc_bam)
 
         # cell type for the single-cell data
         '''
@@ -286,7 +300,8 @@ def finetune_data_generate(
         else:
         '''
         if len(f_sc) > 1:
-            print(f"{f_sc_bam} processing ({f_sc[1]})...")
+            if verbose > 1:
+                print(f"{f_sc_bam} processing ({f_sc[1]})...")
             extracted_reads["ctype"] = f_sc[1]
         else:
             extracted_reads["ctype"] = "NA"
@@ -295,12 +310,21 @@ def finetune_data_generate(
         if(extracted_reads.shape[0] > 0):
             df_reads.append(extracted_reads)
 
+        tqdm_bar.update()
+
     # Integrate all reads and shuffle
     if len(df_reads) > 0:
-        df_reads = pd.concat(df_reads, ignore_index=True).sample(frac=1).reset_index(drop=True) # sample is for shuffling
-        print("Fine-tuning data generated:", df_reads.head())
+        df_reads = pd.concat(df_reads, ignore_index=True) \
+            .sample(frac=1) \
+            .reset_index(drop=True) # sample is for shuffling
+        if verbose > 1:
+            print("Fine-tuning data generated:", df_reads.head())
     else:
         ValueError("Could not find any reads overlapping with the given DMRs. Please try different regions.")
+
+    if verbose > 1:
+        print("Total sequences per cell type")
+        print(df_reads["ctype"].value_counts())
 
     # Split the data into train and train/valid/test
     if np.sum(split_ratios) == 1 and len(split_ratios) == 3:
@@ -309,14 +333,17 @@ def finetune_data_generate(
         fp_test_seq = os.path.join(output_dir, "test_seq.csv")
 
         # TODO: make this split memory efficient
-        df_train, df_test = train_test_split(df_reads, test_size=split_ratios[0],
+        val_test_size = 1 - split_ratios[0]
+        df_train, df_test = train_test_split(df_reads, test_size=val_test_size,
                                              random_state=seed,
                                              stratify=df_reads["ctype"])
         test_size = split_ratios[2] / (split_ratios[0] + split_ratios[1])
-        df_val, df_test = train_test_split(df_reads, test_size=test_size,
+        df_val, df_test = train_test_split(df_test, test_size=test_size,
                                            random_state=seed,
-                                           stratify=df_reads["ctype"])
-        print("Size - train %d seqs , valid %d seqs "%(df_train.shape[0], df_test.shape[0]))
+                                           stratify=df_test["ctype"])
+        if verbose > 0:
+            print("Size - train %d seqs , valid %d seqs "%(df_train.shape[0],
+                                                           df_test.shape[0]))
 
         # Write train & test files
         df_train.to_csv(fp_train_seq, sep="\t", header=True, index=None)
