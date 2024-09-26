@@ -2,16 +2,17 @@ import os
 import time
 import warnings
 
+import mlflow
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.metrics import accuracy_score, auc, roc_curve
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from transformers import (BertConfig, BertForMaskedLM,
                           BertForSequenceClassification)
 
@@ -109,14 +110,15 @@ class MethylBertTrainer(object):
                                lr=self._config.lr, betas=self._config.beta, eps=self._config.eps, weight_decay=self._config.weight_decay)
 
 
-    def train(self, steps: int = 0):
+    def train(self, steps: int = 0, verbose: int = 1,
+              mlflow_logging: bool = True):
         '''
         Train MethylBERT over given steps
 
         steps: int
             number of steps to train the model
         '''
-        return self._iteration(steps, self.train_data)
+        return self._iteration(steps, self.train_data, verbose, mlflow_logging)
 
     def test(self, test_dataloader: DataLoader):
         '''
@@ -226,7 +228,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
         return predict_res, np.mean(mean_loss)
 
 
-    def _iteration(self, steps, data_loader):
+    def _iteration(self, steps, data_loader, verbose, mlflow_logging):
         """
         loop over the data_loader for training or testing
         if on train status, backward operation is activated
@@ -447,7 +449,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         else:
             return predict_res, mean_loss, np.concatenate(return_logits, axis=0)
 
-    def _iteration(self, steps, data_loader):
+    def _log_to_mlflow(self, metrics: dict, step: int):
+        mlflow.log_metrics(metrics, step)
+
+    def _iteration(self, steps, data_loader, verbose = 1,
+                   mlflow_logging: bool = True):
         """
         loop over the data_loader for training or testing
         if on train status, backward operation is activated
@@ -485,14 +491,17 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         epochs = steps // (len(data_loader) // self._config.gradient_accumulation_steps) + 1
 
         self.model.zero_grad()
-        #print(self.model.training)
+        if verbose > 0:
+            print(self.model.training)
         self.model.train()
         train_prediction_res = {"dmr_label":[], "pred_ctype_label":[], "ctype_label":[]}
 
         scaler = GradScaler() if self._config.amp else None
 
         duration = 0
+        epoch_progress_bar = tqdm(total=epochs, desc="Training...")
         for epoch in range(epochs):
+            steps_progress_bar = tqdm(total=steps, desc=f"Epoch {epoch+1}/{epochs}")
             for i, batch in enumerate(data_loader):
                 # 0. batch_data will be sent into the device(GPU or cpu)
                 data = {key: value.to(self.device) for key, value in batch.items() if type(value) != list}
@@ -548,20 +557,22 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
                     del eval_pred
 
-
                     if self.step % self._config.log_freq == 0:
-                        print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
-                        print(f"Running time for iter = {duration}")
+                        if verbose > 0:
+                            print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
+                            print(f"Running time for iter = {duration}")
 
                     if self.min_loss > eval_loss:
-                        print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, eval_loss, self.min_loss, self.save_path))
+                        if verbose > 0:
+                            print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, eval_loss, self.min_loss, self.save_path))
                         self.save(self.save_path)
                         self.min_loss = eval_loss
 
                     # For saving an interim model to track the training
                     if ( type(self._config.save_freq) == int ) and (self.step % self._config.save_freq == 0):
                         step_save_dir=self.save_path.replace("bert.model", "bert.model_step%d"%(self.step))
-                        print("Step %d: Save an interim model at %s"%(self.step, step_save_dir))
+                        if verbose > 0:
+                            print("Step %d: Save an interim model at %s"%(self.step, step_save_dir))
                         if not os.path.exists(step_save_dir):
                             os.mkdir(step_save_dir)
                         self.save(step_save_dir)
@@ -576,6 +587,15 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
                         f_perform.write("\t".join([str(self.step), str(global_step_loss), str(train_ctype_acc),  str(self.optim.param_groups[0]["lr"])])+"\n")
 
+                    if mlflow_logging:
+                        metrics = {
+                            "global_step_loss": global_step_loss,
+                            "lr": self.optim.param_groups[0]["lr"],
+                            "eval_loss": eval_loss,
+                            "duration": duration
+                        }
+                        self._log_to_mlflow(metrics, self.step)
+
                     self.step += 1
                     duration=0
                     global_step_loss = 0
@@ -584,9 +604,17 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     del train_prediction_res
                     train_prediction_res =  {"dmr_label":[], "pred_ctype_label":[], "ctype_label":[]}
 
+
+
+                steps_progress_bar.update()
+                steps_progress_bar.set_postfix(eval_loss=eval_loss)
+
                 if steps == self.step:
                     break
                 local_step+=1
+
+            steps_progress_bar.close()
+            epoch_progress_bar.update()
 
             if steps == self.step:
                 break

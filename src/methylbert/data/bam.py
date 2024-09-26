@@ -44,9 +44,6 @@ def process_bismark_read(ref_seq, read):
 	except KeyError:
 		# print("no methylation call for read", read.reference_id )
 		return None
-	except ValueError:
-		# print("no methylation call for read", read.reference_id )
-		return None
 
 	# No CpG methylation on the read
 	if xm_tag.count("z") + xm_tag.count("Z") == 0:
