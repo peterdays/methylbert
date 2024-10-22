@@ -362,9 +362,6 @@ def finetune_data_generate(
         )
 
         # TODO: we should somehow account for ctype stratification
-
-        # Write train & test files (adding a final column because of sep="\t")
-        df_reads["non_null_col"] = ""
         df_reads.loc[df_reads["filename"].isin(train_files), :] \
             .to_csv(fp_train_seq, sep="\t", header=True, index=None)
         df_reads.loc[df_reads["filename"].isin(val_files), :] \

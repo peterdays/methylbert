@@ -45,7 +45,7 @@ def _parse_line(l, headers):
 	return l
 
 
-def _line2tokens_finetune(l, tokenizer, max_len=150, headers=None):
+def _line2tokens_finetune(l, tokenizer, max_len=150):
 	# parsed line!
 
 	l["dna_seq"] = l["dna_seq"].split(" ")
@@ -273,7 +273,7 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 
 		item = _line2tokens_finetune(
 			l=line,
-			tokenizer=self.vocab, max_len=self.seq_len, headers=self.headers)
+			tokenizer=self.vocab, max_len=self.seq_len)
 
 		item["dna_seq"] = torch.squeeze(torch.tensor(np.array(item["dna_seq"], dtype=np.int32)))
 		item["methyl_seq"] = torch.squeeze(torch.tensor(np.array(item["methyl_seq"], dtype=np.int8)))
